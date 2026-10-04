@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>轨迹时间最优速度规划报告</title>
+<style>
+  :root { --fg:#1c1e21; --muted:#6b7280; --accent:#2563eb; --bg:#fff; --grid:#e5e7eb; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; color:var(--fg);
+         margin:0; padding:24px; background:#f8fafc; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  .bar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+  .bar button, .bar select { font-size:13px; padding:5px 12px; border:1px solid #d1d5db;
+         border-radius:6px; background:var(--bg); cursor:pointer; }
+  .bar button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .panel { background:var(--bg); border:1px solid #e5e7eb; border-radius:10px;
+           padding:16px; margin-bottom:16px; }
+  canvas { display:block; width:100%; }
+  #pathCanvas { height:260px; }
+  .plot { height:180px; }
+  .plots { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width: 900px) { .plots { grid-template-columns:1fr; } }
+  input[type=range] { flex:1; min-width:160px; }
+  .clock { font-variant-numeric:tabular-nums; font-size:13px; color:var(--muted); min-width:210px; }
+  .badge { display:inline-block; background:#eef2ff; color:#3730a3; border-radius:4px;
+           padding:1px 6px; font-size:12px; margin-right:6px; }
+</style>
+</head>
+<body>
+<h1>轨迹时间最优速度规划报告</h1>
+<div class="sub" id="meta"></div>
+
+<div class="bar">
+  <span>曲线模型:</span>
+  <button id="btnTrap">梯形 Trapezoid</button>
+  <button id="btnSCurve">S 曲线 S-Curve</button>
+  <span style="width:12px"></span>
+  <button id="btnPlay">▶ 播放</button>
+  <button id="btnPrev">⏮ 上一帧</button>
+  <button id="btnNext">⏭ 下一帧</button>
+  <select id="speed">
+    <option value="0.25">0.25×</option>
+    <option value="0.5">0.5×</option>
+    <option value="1" selected>1×</option>
+    <option value="2">2×</option>
+    <option value="4">4×</option>
+  </select>
+  <input type="range" id="scrub" min="0" max="1000" value="0">
+  <span class="clock" id="clock"></span>
+</div>
+
+<div class="panel"><canvas id="pathCanvas"></canvas></div>
+<div class="plots">
+  <div class="panel"><canvas class="plot" id="plotS"></canvas></div>
+  <div class="panel"><canvas class="plot" id="plotV"></canvas></div>
+  <div class="panel"><canvas class="plot" id="plotA"></canvas></div>
+  <div class="panel"><canvas class="plot" id="plotJ"></canvas></div>
+</div>
+
+<script>
+"use strict";
+const DATA = /*__DATA__*/;
+
+const profiles = DATA.profiles;
+let kind = "trapezoid";
+let frame = 0;          // index into samples
+let playing = false;
+let speed = 1;
+let lastTs = null;
+let acc = 0;
+
+const $ = id => document.getElementById(id);
+
+function prof() { return profiles[kind]; }
+function nFrames() { return prof().samples.length; }
+function cur() { return prof().samples[Math.min(frame, nFrames()-1)]; }
+
+// ---------- path geometry ----------
+const wp = DATA.path;
+const segLens = [];
+let totalLen = 0;
+for (let i = 1; i < wp.x.length; i++) {
+  const d = Math.hypot(wp.x[i]-wp.x[i-1], wp.y[i]-wp.y[i-1]);
+  segLens.push(d); totalLen += d;
+}
+function pointAt(s) {
+  s = Math.max(0, Math.min(totalLen, s));
+  let accLen = 0;
+  for (let i = 0; i < segLens.length; i++) {
+    if (s <= accLen + segLens[i] || i === segLens.length-1) {
+      const f = segLens[i] === 0 ? 0 : (s - accLen) / segLens[i];
+      return [wp.x[i] + f*(wp.x[i+1]-wp.x[i]), wp.y[i] + f*(wp.y[i+1]-wp.y[i])];
+    }
+    accLen += segLens[i];
+  }
+  return [wp.x[wp.x.length-1], wp.y[wp.y.length-1]];
+}
+
+// ---------- canvas helpers ----------
+function setupCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const r = cv.getBoundingClientRect();
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, r.width, r.height];
+}
+
+function drawPath() {
+  const cv = $("pathCanvas");
+  const [ctx, W, H] = setupCanvas(cv);
+  ctx.clearRect(0, 0, W, H);
+  const xs = wp.x, ys = wp.y;
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const pad = 30;
+  const sc = Math.min((W-2*pad)/Math.max(maxX-minX, 1e-9), (H-2*pad)/Math.max(maxY-minY, 1e-9));
+  const ox = pad + ((W-2*pad) - (maxX-minX)*sc)/2;
+  const oy = pad + ((H-2*pad) - (maxY-minY)*sc)/2;
+  const P = (x, y) => [ox + (x-minX)*sc, H - (oy + (y-minY)*sc)];
+
+  // full path
+  ctx.strokeStyle = "#9ca3af"; ctx.lineWidth = 2; ctx.beginPath();
+  wp.x.forEach((x, i) => { const [px, py] = P(x, wp.y[i]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+  ctx.stroke();
+  // waypoints
+  ctx.fillStyle = "#6b7280";
+  wp.x.forEach((x, i) => { const [px, py] = P(x, wp.y[i]); ctx.beginPath(); ctx.arc(px, py, 3.5, 0, 7); ctx.fill(); });
+
+  // travelled trail + current position
+  const sm = cur();
+  const [cx, cy] = pointAt(sm[1]);
+  ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 3; ctx.beginPath();
+  const steps = 120;
+  for (let i = 0; i <= steps; i++) {
+    const [px, py] = P(...pointAt(sm[1]*i/steps));
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  }
+  ctx.stroke();
+  const [px, py] = P(cx, cy);
+  ctx.fillStyle = "#dc2626"; ctx.beginPath(); ctx.arc(px, py, 6, 0, 7); ctx.fill();
+  ctx.fillStyle = "#111827"; ctx.font = "12px sans-serif";
+  ctx.fillText(`s = ${sm[1].toFixed(3)} m   v = ${sm[2].toFixed(3)} m/s   a = ${sm[3].toFixed(3)} m/s²`, 10, 16);
+}
+
+// ---------- plots ----------
+function drawPlot(canvasId, label, unit, idx, limit) {
+  const cv = $(canvasId);
+  const [ctx, W, H] = setupCanvas(cv);
+  ctx.clearRect(0, 0, W, H);
+  const p = prof();
+  const samples = p.samples;
+  const padL = 56, padR = 12, padT = 22, padB = 26;
+  const iw = W-padL-padR, ih = H-padT-padB;
+  let lo = Infinity, hi = -Infinity;
+  for (const s of samples) { const v = s[idx]; if (v<lo) lo=v; if (v>hi) hi=v; }
+  if (limit) { lo = Math.min(lo, -limit); hi = Math.max(hi, limit); }
+  if (hi - lo < 1e-9) { hi += 1; lo -= 1; }
+  const span = hi-lo; lo -= 0.08*span; hi += 0.08*span;
+  const T = p.total;
+  const X = t => padL + iw * (T === 0 ? 0 : t/T);
+  const Y = v => padT + ih * (1 - (v-lo)/(hi-lo));
+
+  // grid + axes
+  ctx.strokeStyle = "#e5e7eb"; ctx.fillStyle = "#6b7280";
+  ctx.font = "10px sans-serif"; ctx.lineWidth = 1;
+  for (let g = 0; g <= 4; g++) {
+    const v = lo + (hi-lo)*g/4, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W-padR, y); ctx.stroke();
+    ctx.fillText(v.toFixed(2), 6, y+3);
+  }
+  for (let g = 0; g <= 5; g++) {
+    const t = T*g/5, x = X(t);
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, H-padB); ctx.stroke();
+    ctx.fillText(t.toFixed(1)+"s", x-10, H-8);
+  }
+  // limit lines
+  if (limit) {
+    ctx.strokeStyle = "#f87171"; ctx.setLineDash([5,4]);
+    for (const lv of [limit, -limit]) {
+      if (lv >= lo && lv <= hi) {
+        ctx.beginPath(); ctx.moveTo(padL, Y(lv)); ctx.lineTo(W-padR, Y(lv)); ctx.stroke();
+      }
+    }
+    ctx.setLineDash([]);
+  }
+  // zero line
+  if (lo < 0 && hi > 0) {
+    ctx.strokeStyle = "#d1d5db";
+    ctx.beginPath(); ctx.moveTo(padL, Y(0)); ctx.lineTo(W-padR, Y(0)); ctx.stroke();
+  }
+  // curve
+  ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.6; ctx.beginPath();
+  samples.forEach((s, i) => { const x = X(s[0]), y = Y(s[idx]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.stroke();
+  // time cursor
+  const sm = cur();
+  ctx.strokeStyle = "#dc2626"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(X(sm[0]), padT); ctx.lineTo(X(sm[0]), H-padB); ctx.stroke();
+  ctx.fillStyle = "#111827"; ctx.font = "12px sans-serif";
+  ctx.fillText(`${label} (${unit})`, padL, 14);
+}
+
+function drawAll() {
+  drawPath();
+  drawPlot("plotS", "位置 s", "m", 1, 0);
+  drawPlot("plotV", "速度 v", "m/s", 2, DATA.limits.Vmax);
+  drawPlot("plotA", "加速度 a", "m/s²", 3, DATA.limits.Amax);
+  if (kind === "scurve") {
+    $("plotJ").parentElement.style.display = "";
+    drawPlot("plotJ", "jerk j", "m/s³", 4, DATA.limits.Jmax);
+  } else {
+    // 梯形曲线加速度分段恒定，jerk 在边界处为脉冲，模型上无意义
+    $("plotJ").parentElement.style.display = "none";
+  }
+  const sm = cur();
+  $("clock").textContent =
+    `t = ${sm[0].toFixed(3)} / ${prof().total.toFixed(3)} s   帧 ${frame+1}/${nFrames()}`;
+  $("scrub").value = nFrames() > 1 ? Math.round(1000*frame/(nFrames()-1)) : 0;
+}
+
+// ---------- transport ----------
+function setFrame(f) {
+  frame = Math.max(0, Math.min(nFrames()-1, f));
+  drawAll();
+}
+function setKind(k) {
+  kind = k; frame = 0;
+  $("btnTrap").classList.toggle("active", k === "trapezoid");
+  $("btnSCurve").classList.toggle("active", k === "scurve");
+  drawAll();
+}
+$("btnTrap").onclick = () => setKind("trapezoid");
+$("btnSCurve").onclick = () => setKind("scurve");
+$("btnPlay").onclick = () => {
+  playing = !playing;
+  $("btnPlay").textContent = playing ? "⏸ 暂停" : "▶ 播放";
+  lastTs = null;
+};
+$("btnPrev").onclick = () => { playing = false; $("btnPlay").textContent = "▶ 播放"; setFrame(frame-1); };
+$("btnNext").onclick = () => { playing = false; $("btnPlay").textContent = "▶ 播放"; setFrame(frame+1); };
+$("speed").onchange = e => { speed = parseFloat(e.target.value); };
+$("scrub").oninput = e => { setFrame(Math.round(parseInt(e.target.value, 10)/1000*(nFrames()-1))); };
+
+function tick(ts) {
+  if (playing) {
+    if (lastTs !== null) {
+      acc += (ts - lastTs)/1000 * speed;
+      const dt = prof().dt;
+      while (acc >= dt) { acc -= dt; frame++; }
+      if (frame >= nFrames()-1) {
+        frame = nFrames()-1; playing = false;
+        $("btnPlay").textContent = "▶ 播放";
+      }
+      drawAll();
+    }
+    lastTs = ts;
+  }
+  requestAnimationFrame(tick);
+}
+
+// ---------- init ----------
+$("meta").innerHTML =
+  `<span class="badge">v_max = ${DATA.limits.Vmax} m/s</span>` +
+  `<span class="badge">a_max = ${DATA.limits.Amax} m/s²</span>` +
+  `<span class="badge">j_max = ${DATA.limits.Jmax} m/s³</span>` +
+  `<span class="badge">路径全长 ${totalLen.toFixed(3)} m / ${wp.x.length} 个路径点</span>` +
+  `<span class="badge">梯形总时长 ${profiles.trapezoid.total.toFixed(3)} s</span>` +
+  `<span class="badge">S 曲线总时长 ${profiles.scurve.total.toFixed(3)} s</span>`;
+setKind("scurve");
+window.addEventListener("resize", drawAll);
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
